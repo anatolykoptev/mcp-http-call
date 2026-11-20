@@ -1,0 +1,237 @@
+#!/usr/bin/env -S python3 -B
+"""mcp-http-call - call a tool on an HTTP MCP server from the shell (streamable HTTP, stdlib only).
+
+  mcp-http-call list SERVER                       one line per tool (name + first sentence)
+  mcp-http-call describe SERVER TOOL              arguments of one tool: name type [required] - description
+  mcp-http-call call SERVER TOOL [k=v ...] [--json '{...}'] [--jq FILTER] [--out FILE] [--max-chars N]
+
+SERVER is a full http(s) URL, or a bare name when MCP_HTTP_CALL_GATEWAY is set to a template with one
+`{}` (for example `https://gateway.example.com/{}/mcp`).
+Auth: none by default. With MCP_HTTP_CALL_HELPER set to a command, it is run as `COMMAND URL` at call time and
+must print a JSON object of HTTP headers (for example {"Authorization": "Bearer ..."}); the headers live only in
+this process's memory: never argv, never the environment, never a file.
+k=v: the value is parsed as JSON when it parses (numbers, true/false, [..], {..}), else it is a string;
+force a string with k:=text. --json merges a whole argument object.
+Output: text content of the result; JSON text is re-emitted compact. --jq pipes it through jq.
+--out FILE saves the full output and prints a one-line summary instead. Without --out, output beyond
+--max-chars (default 20000) is cut and the cut is announced on stderr.
+Exit: 0 ok, 1 the tool returned isError, 2 usage, 3 transport/auth failure.
+"""
+import json, os, shlex, subprocess, sys, urllib.request, urllib.error
+
+HELPER = os.environ.get("MCP_HTTP_CALL_HELPER", "")
+GATEWAY = os.environ.get("MCP_HTTP_CALL_GATEWAY", "")
+TIMEOUT = 120
+
+
+def die(code, msg):
+    print("mcp-http-call: " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def server_url(s):
+    if s.startswith("https://") or s.startswith("http://"):
+        return s
+    if s.replace("-", "").isalnum():
+        if GATEWAY.count("{}") != 1:
+            die(2, "bare server name %r needs MCP_HTTP_CALL_GATEWAY (a URL template with one {}); or pass a full URL" % s)
+        return GATEWAY.replace("{}", s)
+    die(2, "SERVER must be a name or a URL: " + s)
+
+
+def auth_headers(url):
+    if not HELPER:
+        return {}
+    cmd = [os.path.expanduser(a) for a in shlex.split(HELPER)]
+    try:
+        p = subprocess.run(cmd + [url], capture_output=True, text=True)
+    except OSError as e:
+        die(3, "auth helper could not run: %s" % e)
+    if p.returncode != 0:
+        err = p.stderr.strip().splitlines()
+        die(3, "auth helper failed: " + (err[-1] if err else "no output"))
+    try:
+        h = json.loads(p.stdout)
+    except ValueError:
+        die(3, "auth helper did not print a JSON object of headers")
+    if not isinstance(h, dict):
+        die(3, "auth helper did not print a JSON object of headers")
+    return h
+
+
+class Session:
+    def __init__(self, url):
+        self.url, self.sid, self.hdr = url, None, auth_headers(url)
+        self.n = 0
+        r = self.rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                    "clientInfo": {"name": "mcp-http-call", "version": "1"}})
+        self.proto = r.get("protocolVersion", "2025-06-18")
+        self.rpc("notifications/initialized", None, notify=True)
+
+    def rpc(self, method, params, notify=False):
+        body = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            body["params"] = params
+        if not notify:
+            self.n += 1
+            body["id"] = self.n
+        h = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream", **self.hdr}
+        if self.sid:
+            h["Mcp-Session-Id"] = self.sid
+            h["MCP-Protocol-Version"] = self.proto
+        req = urllib.request.Request(self.url, json.dumps(body).encode(), h)
+        try:
+            r = urllib.request.urlopen(req, timeout=TIMEOUT)
+        except urllib.error.HTTPError as e:
+            die(3, "HTTP %d from server (%s)" % (e.code, e.read(200).decode("utf8", "replace").strip()))
+        except Exception as e:
+            die(3, "transport error: %s" % e)
+        self.sid = r.headers.get("Mcp-Session-Id") or self.sid
+        txt = r.read().decode("utf8", "replace")
+        if notify or not txt.strip():
+            return {}
+        if not txt.lstrip().startswith("{"):  # SSE: take the last data: line carrying our response
+            datas = [l[5:].strip() for l in txt.splitlines() if l.startswith("data:")]
+            txt = datas[-1] if datas else "{}"
+        msg = json.loads(txt)
+        if "error" in msg:
+            die(3, "rpc error: %s" % json.dumps(msg["error"]))
+        return msg.get("result", {})
+
+    def close(self):
+        if self.sid:
+            try:
+                urllib.request.urlopen(urllib.request.Request(
+                    self.url, method="DELETE", headers={"Mcp-Session-Id": self.sid, **self.hdr}), timeout=10)
+            except Exception:
+                pass
+
+
+def all_tools(s):
+    tools, cur = [], None
+    while True:
+        r = s.rpc("tools/list", {"cursor": cur} if cur else {})
+        tools += r.get("tools", [])
+        cur = r.get("nextCursor")
+        if not cur:
+            return tools
+
+
+def first_sentence(d):
+    d = " ".join((d or "").split())
+    i = d.find(". ")
+    return d[: i + 1] if 0 < i < 160 else d[:160]
+
+
+def parse_kv(items):
+    out = {}
+    for it in items:
+        if ":=" in it and it.index(":=") < (it.index("=") if "=" in it else 1 << 30):
+            k, v = it.split(":=", 1)
+        elif "=" in it:
+            k, v = it.split("=", 1)
+            try:
+                v = json.loads(v)
+            except ValueError:
+                pass
+        else:
+            die(2, "argument is not k=v: " + it)
+        out[k] = v
+    return out
+
+
+def result_text(res):
+    parts = [c.get("text", "") for c in res.get("content", []) if c.get("type") == "text"]
+    other = [c.get("type") for c in res.get("content", []) if c.get("type") != "text"]
+    txt = "\n".join(parts)
+    if not txt and "structuredContent" in res:
+        txt = json.dumps(res["structuredContent"], ensure_ascii=False)
+    if other:
+        txt += "\n[mcp-http-call: non-text content dropped: %s]" % ",".join(other)
+    return txt
+
+
+def compact(txt):
+    try:
+        return json.dumps(json.loads(txt), ensure_ascii=False, separators=(",", ":"))
+    except ValueError:
+        return txt
+
+
+def summary(txt, path):
+    try:
+        d = json.loads(txt)
+    except ValueError:
+        return "saved %d chars to %s (text)" % (len(txt), path)
+    def shape(v):
+        if isinstance(v, list):
+            return "list[%d]" % len(v)
+        if isinstance(v, dict):
+            return "{" + ",".join("%s:%s" % (k, shape(x) if isinstance(x, (list, dict)) else type(x).__name__) for k, x in list(v.items())[:12]) + "}"
+        return type(v).__name__
+    return "saved %d chars to %s  shape=%s" % (len(txt), path, shape(d))
+
+
+def main(argv):
+    if len(argv) < 2 or argv[0] in ("-h", "--help"):
+        print(__doc__.strip()); sys.exit(0 if argv and argv[0] in ("-h", "--help") else 2)
+    cmd, srv, rest = argv[0], argv[1], argv[2:]
+    url = server_url(srv)
+    if cmd == "list":
+        s = Session(url)
+        for t in all_tools(s):
+            print("%s  %s" % (t["name"], first_sentence(t.get("description"))))
+        s.close()
+    elif cmd == "describe":
+        if not rest: die(2, "describe SERVER TOOL")
+        s = Session(url)
+        t = next((x for x in all_tools(s) if x["name"] == rest[0]), None)
+        s.close()
+        if not t: die(2, "no such tool: " + rest[0])
+        print(" ".join((t.get("description") or "").split()))
+        sch, req = t.get("inputSchema", {}), t.get("inputSchema", {}).get("required", [])
+        for k, v in sch.get("properties", {}).items():
+            ty = v.get("type"); ty = "|".join(ty) if isinstance(ty, list) else ty
+            print("  %s %s%s - %s" % (k, ty, " [required]" if k in req else "", " ".join((v.get("description") or "").split())))
+    elif cmd == "call":
+        if not rest: die(2, "call SERVER TOOL [k=v ...]")
+        tool, rest = rest[0], rest[1:]
+        jq = out = None; maxc = 20000; kv = []; args = {}
+        i = 0
+        while i < len(rest):
+            a = rest[i]
+            if a in ("--jq", "--out", "--max-chars", "--json"):
+                if i + 1 >= len(rest): die(2, a + " needs a value")
+                v = rest[i + 1]; i += 2
+                if a == "--jq": jq = v
+                elif a == "--out": out = v
+                elif a == "--max-chars": maxc = int(v)
+                else: args.update(json.loads(v))
+            else:
+                kv.append(a); i += 1
+        args.update(parse_kv(kv))
+        s = Session(url)
+        res = s.rpc("tools/call", {"name": tool, "arguments": args})
+        s.close()
+        txt = compact(result_text(res))
+        if res.get("isError"):
+            die(1, "tool error: " + txt[:2000])
+        if jq:
+            p = subprocess.run(["jq", "-cr", jq], input=txt, capture_output=True, text=True)
+            if p.returncode != 0: die(2, "jq: " + p.stderr.strip())
+            txt = p.stdout.rstrip("\n")
+        if out:
+            with open(out, "w") as f: f.write(txt)
+            print(summary(txt, out))
+        else:
+            if len(txt) > maxc:
+                print("mcp-http-call: output cut at %d of %d chars; use --jq to select fields or --out FILE to save it" % (maxc, len(txt)), file=sys.stderr)
+                txt = txt[:maxc]
+            print(txt)
+        sys.exit(1 if res.get("isError") else 0)
+    else:
+        die(2, "unknown command: " + cmd)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
