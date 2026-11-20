@@ -6,10 +6,18 @@ JSON or SSE replies).
 
 ## Why
 
-An agent that loads an MCP server pays for every tool schema in its context window, on every turn, whether it
-calls the tool or not. A CLI moves that cost to the moment of use: the agent runs `list` once, `describe` for
-the one tool it needs, and `call` for the result, and a skill or a README line is enough to teach it the
-pattern. `--jq` and `--out` keep large results out of the context as well.
+How much an MCP server costs an agent depends on the client. A client that loads tools eagerly puts every
+tool schema in the context window on every turn, whether or not the tool is called. A client with deferred
+tool loading (Claude Code's tool search, for example) loads only tool names plus the server's instructions
+until a tool is searched for, so the schemas are not the cost there.
+
+The CLI's wins hold either way:
+
+- **Trim results before they reach the context.** `--jq` filters a reply and `--out` writes it to a file, so a
+  large result never has to be read in full.
+- **Script it.** `list`, `describe` and `call` are shell commands: loops, pipes and retries need no extra model turns.
+- **No MCP client needed.** An agent with a shell but no MCP support can still use the server; a skill or a
+  README line is enough to teach it the pattern.
 
 ## Install
 
